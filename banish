@@ -1,0 +1,263 @@
+#!/usr/bin/python3
+
+#
+# BANISH
+#
+# A Python3-based daemon that takes care of SRM-ing files for you
+# License : CC0
+# V0.1.0
+
+
+"""
+Main Module for the Banish Daemon & Client
+"""
+
+import os           # os.getcwd()
+import os.path      # os.path.exists
+import socket       # All of our networking, basically
+import sys          # sys.stdout
+
+import threading    # threading.Thread
+import queue        # queue.Queue
+
+import subprocess   # subprocess.run, PIPE and CalledProcessError
+
+import argparse     # Argument parsing
+
+from io import StringIO
+
+class Scheduler(threading.Thread):
+    """
+    Scheduler thread.
+    This thread, once started, can receive file paths to launch SRM commands on.
+    """
+    def __init__(self):
+        threading.Thread.__init__(self)
+        self.schedule = queue.Queue()
+        self.running = False
+        self.stdout = StringIO()
+
+    def start(self):
+        self.running = True
+        threading.Thread.start(self)
+
+    def stop(self):
+        """
+        Tell the Scheduler thread to halt
+        """
+        self.running = False
+
+    def give_stdout(self, stream):
+        """
+        Give the scheduler thread a standard output stream
+        """
+        self.stdout = stream
+
+    def push(self, path):
+        """
+        Push a file path into the schedule
+        """
+        self.schedule.put(path)
+        print("Scheduled {}".format(path))
+        # print("Current queue occupation : {}".format(len(self.schedule)))
+
+    def pull(self):
+        """
+        Pull information from the Scheduler thread
+        """
+        return self.schedule.qsize()
+
+    def run(self):
+        while self.running:
+            try:
+                query = self.schedule.get()
+            except queue.Empty:
+                continue
+
+            print("Launching query {}".format(query))
+            try:
+                process = subprocess.run(query, stderr=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, check=True)
+                self.stdout.write(str(process.stdout, "utf8"))
+            except subprocess.CalledProcessError as err:
+                print("Subprocess call error : {}".format(err))
+            else:
+                print("Query {} succeeded".format(query))
+            finally:
+                self.schedule.task_done()
+
+
+SOCKET_PATH = "/tmp/banish"
+
+def send_kill_process():
+    """
+    Send the death sequence to a running banish daemon
+    """
+    if not os.path.exists(SOCKET_PATH):
+        print("No daemon to kill")
+        return
+
+    murderer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    murderer.connect(SOCKET_PATH)
+    murderer.send(b"\0\n\r\a")
+    murderer.close()
+
+def client_run(files):
+    """
+    Run the banish client
+    """
+    if not os.path.exists(SOCKET_PATH):
+        print("Socket not found.. is the server running (-d)?")
+        return
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(SOCKET_PATH)
+    for fname in files:
+        client.send(bytes("SRM;{}{}{}\n\r\a".format(os.getcwd(), os.path.sep, fname), "utf8"))
+        print("Banishing {}".format(fname))
+    client.close()
+
+class Server:
+    """
+    The Banish Daemon Server
+    """
+    def __init__(self):
+        self.scheduler = Scheduler()
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.stdout = StringIO()
+
+    def server_handle(self, conn):
+        """
+        Handle a connection to the server
+        """
+        datagram = b""
+        while self.scheduler.running:
+            datagram += conn.recv(1024)
+            if datagram == b"":
+                break
+            while b"\n\r\a" in datagram:
+                # Gather a file
+                offset = datagram.find(b"\n\r\a")
+                packet = datagram[0:offset]
+                datagram = datagram[offset+3:]
+                if packet == b"\0":
+                    print("Received death sequence")
+                    self.scheduler.stop()
+                    break
+
+                order, filepath = packet.split(b";")
+                if order == b"SRM":
+                    self.scheduler.push(["srm", "-fdrvvv", str(filepath, "utf8")])
+                elif order[:5] == b"POLL/":
+                    suborder = order.split(b'/')[1]
+                    if suborder == b"SIZE":
+                        conn.send(bytes("DATA;SIZE={}".format(self.scheduler.pull()), "utf8"))
+                    elif suborder == b"LOG":
+                        ret = "=" * 10 + "LOGS" + "=" * 10 + "\n"
+                        self.stdout.seek(0)
+                        ret += self.stdout.read()
+                        conn.send(bytes("DATA;{}".format(ret), "utf8"))
+
+                else:
+                    print("Unknown order : "+ order)
+        conn.close()
+
+    def start(self):
+        """
+        Start the banish server
+        """
+
+        if os.path.exists(SOCKET_PATH):
+            try:
+                send_kill_process()
+            except ConnectionRefusedError:
+                pass # There was nobody listening then
+            os.remove(SOCKET_PATH)
+
+        sys.stdout = self.stdout
+        self.socket.bind(SOCKET_PATH)
+        print("Server listening at {}".format(SOCKET_PATH))
+
+        self.socket.listen()
+        self.socket.setblocking(False)
+        #self.scheduler.give_stdout(self.stdout)
+        self.scheduler.start()
+        threads = []
+        while self.scheduler.running:
+            try:
+                conn, _ = self.socket.accept()
+            except BlockingIOError:
+                continue
+            else:
+                threads.append(threading.Thread(target=self.server_handle, args=(conn,)))
+                threads[-1].start()
+
+        print("Stopping server, bye bye o/")
+        self.socket.close()
+        os.remove(SOCKET_PATH)
+        os.remove("/tmp/banish.pid")
+
+def poll(queries):
+    """
+    Poll server for data
+    """
+    if not os.path.exists(SOCKET_PATH):
+        print("No server running. No server running means no data to poll. " +
+              "No palace means no palace.")
+        return
+
+    poller = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    poller.connect(SOCKET_PATH)
+    for query in queries:
+        poller.send(bytes("POLL/{};\n\r\a".format(query), "utf8"))
+        print("{}".format(str(poller.recv(1024).split(b"DATA;")[1], "utf8")))
+
+    poller.close()
+
+def main():
+    """
+    Execute the banish process
+    """
+
+    parser = argparse.ArgumentParser(description="Control the Banish D(a)emon")
+    group = parser.add_mutually_exclusive_group()
+
+
+    group.add_argument("-s", "--spawn", action="store_true",
+                       help="Spawn a new instance of the daemon")
+    group.add_argument("-k", "--kill", action="store_true",
+                       help="Kill the currently running daemon instance")
+    group.add_argument("-p", "--poll", action="store", nargs="+",
+                       choices=["SIZE", "LOG"],
+                       help="Poll the banish daemon for information")
+    parser.add_argument("paths", nargs="*", help="Filesystem paths to add to the banishing queue")
+
+
+    args = parser.parse_args()
+    print(args)
+
+    # First order of the day, start the daemon
+    if args.spawn:
+        pid = os.fork()
+        if pid != 0:
+            print("Process forked (PID: {})".format(pid))
+            open("/tmp/banish.pid", "w").write(str(pid))
+            return
+        server_obj = Server()
+        server_obj.start()
+        return
+
+    # Second order of the day, push in paths
+    if args.paths:
+        client_run(args.paths)
+
+    # Then, if polling is requested, poll
+    if args.poll:
+        poll(args.poll)
+
+    # Lastly, if requested, kill the d(a)emon
+    if args.kill:
+        send_kill_process()
+
+if __name__ == "__main__":
+    main()
